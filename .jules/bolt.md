@@ -1,0 +1,3 @@
+## 2025-05-14 - [Scanner Hot Loop Optimization]
+**Learning:** Directory size accumulation was doing O(Depth) work for EVERY file, which is highly inefficient for deep trees. String allocations for names and paths were happening for EVERY file, even those not in the top 100. On Windows, hard link deduplication was opening every file even if it didn't have multiple links.
+**Action:** Use post-processing to propagate directory sizes (O(Files) + O(Directories * Depth)). Implement path/string cache for parent directories. Defer metadata/string calls for non-top files. Check link count before opening files for hard link dedupe.

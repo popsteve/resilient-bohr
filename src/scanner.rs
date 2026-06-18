@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(target_os = "windows")]
+use std::collections::HashSet;
 use rayon::prelude::*;
 use eframe::egui;
 use crate::models::{FileEntry, ScanProgressState, ScanResults};
@@ -12,6 +14,7 @@ struct LocalAccumulator {
     dir_map: HashMap<String, u64>,
     errors: Vec<String>,
     file_count: u32,
+    last_parent: Option<(std::path::PathBuf, String)>,
 }
 
 #[cfg(target_os = "windows")]
@@ -80,7 +83,7 @@ pub fn start_scan(
     
     std::thread::spawn(move || {
         let scan_start_time = Instant::now();
-        let seen_ids = Arc::new(std::sync::Mutex::new(HashSet::<u128>::new()));
+        #[cfg(target_os = "windows")] let seen_ids = Arc::new(std::sync::Mutex::new(HashSet::<u128>::new()));
 
         let ctx_clone = ctx.clone();
         let local_res = jwalk::WalkDir::new(&root_path_clone)
@@ -104,6 +107,7 @@ pub fn start_scan(
                     dir_map: HashMap::new(),
                     errors: Vec::new(),
                     file_count: 0,
+                    last_parent: None,
                 },
                 |mut acc, entry| {
                     let file_type = entry.file_type;
@@ -124,8 +128,10 @@ pub fn start_scan(
                         // NTFS Hard link deduplication on Windows
                         #[cfg(target_os = "windows")]
                         {
-                            if let Some((volume, file_index, num_links)) = get_windows_file_info(&entry.path()) {
-                                if num_links > 1 {
+                            use std::os::windows::fs::MetadataExt;
+                            // Only call expensive GetFileInformationByHandle if the file has multiple links
+                            if metadata.number_of_links() > 1 {
+                                if let Some((volume, file_index, _)) = get_windows_file_info(&entry.path()) {
                                     let file_id = ((volume as u128) << 64) | (file_index as u128);
                                     let mut seen = seen_ids.lock().unwrap();
                                     if !seen.insert(file_id) {
@@ -137,60 +143,78 @@ pub fn start_scan(
                         }
 
                         let size = metadata.len();
-                        let modified = metadata.modified()
-                            .ok() // Convert Result to Option
-                            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-
-                        let name = entry.file_name().to_string_lossy().to_string();
                         let entry_path = entry.path();
-                        let path_str = entry_path.to_string_lossy().to_string();
-                        let extension = entry_path
-                            .extension()
-                            .map(|e| e.to_string_lossy().to_lowercase())
-                            .unwrap_or_else(|| "no extension".to_string());
 
                         // Lock-free updates to global progress counters
                         progress_scan.files_scanned.fetch_add(1, Ordering::Relaxed);
                         progress_scan.bytes_scanned.fetch_add(size, Ordering::Relaxed);
 
+                        // Get extension for ext_map
+                        let extension = entry_path
+                            .extension()
+                            .map(|e| e.to_string_lossy().to_lowercase())
+                            .unwrap_or_else(|| "no extension".to_string());
+
                         // Accumulate extension details
                         *acc.ext_map.entry(extension.clone()).or_insert(0) += size;
 
-                        // Accumulate parent directories sizes recursively up to root
-                        let root_path_buf = std::path::Path::new(&root_path_clone);
-                        let mut current_dir = entry_path.parent();
-                        while let Some(parent) = current_dir {
-                            if !parent.starts_with(root_path_buf) {
-                                break;
+                        // Accumulate size for immediate parent only (post-process will propagate up)
+                        if let Some(parent) = entry_path.parent() {
+                            let root_path_buf = std::path::Path::new(&root_path_clone);
+                            if parent.starts_with(root_path_buf) {
+                                // Simple cache for last parent path to avoid repeated string conversions
+                                let parent_str = if let Some((ref last_p, ref last_p_str)) = acc.last_parent {
+                                    if last_p == parent {
+                                        last_p_str.clone()
+                                    } else {
+                                        let p_str = parent.to_string_lossy().to_string();
+                                        acc.last_parent = Some((parent.to_path_buf(), p_str.clone()));
+                                        p_str
+                                    }
+                                } else {
+                                    let p_str = parent.to_string_lossy().to_string();
+                                    acc.last_parent = Some((parent.to_path_buf(), p_str.clone()));
+                                    p_str
+                                };
+
+                                if !parent_str.is_empty() {
+                                    *acc.dir_map.entry(parent_str).or_insert(0) += size;
+                                }
                             }
-                            let parent_str = parent.to_string_lossy().to_string();
-                            if parent_str.is_empty() {
-                                break;
-                            }
-                            *acc.dir_map.entry(parent_str).or_insert(0) += size;
-                            current_dir = parent.parent();
                         }
 
                         // Maintain top-100 min-heap like structure (keeping sorted list)
-                        let new_entry = FileEntry {
-                            name,
-                            path: path_str,
-                            size,
-                            modified,
-                            extension,
+                        // Optimization: only perform expensive metadata calls and string allocations for top files
+                        let is_top_file = if acc.top_files.len() < 100 {
+                            true
+                        } else {
+                            size > acc.top_files[99].size
                         };
 
-                        if acc.top_files.len() < 100 {
-                            acc.top_files.push(new_entry);
-                            acc.top_files.sort_unstable_by(|a, b| b.size.cmp(&a.size));
-                        } else {
-                            let min_size = acc.top_files[99].size;
-                            if size > min_size {
+                        if is_top_file {
+                            let modified = metadata.modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            let path_str = entry_path.to_string_lossy().to_string();
+
+                            let new_entry = FileEntry {
+                                name,
+                                path: path_str,
+                                size,
+                                modified,
+                                extension,
+                            };
+
+                            if acc.top_files.len() < 100 {
+                                acc.top_files.push(new_entry);
+                            } else {
                                 acc.top_files[99] = new_entry;
-                                acc.top_files.sort_unstable_by(|a, b| b.size.cmp(&a.size));
                             }
+                            acc.top_files.sort_unstable_by(|a, b| b.size.cmp(&a.size));
                         }
 
                         // Request UI repaint periodically (every 1000 files scanned by this thread)
@@ -209,6 +233,7 @@ pub fn start_scan(
                     dir_map: HashMap::new(),
                     errors: Vec::new(),
                     file_count: 0,
+                    last_parent: None,
                 },
                 |mut acc1, mut acc2| {
                     // Merge top files
@@ -238,11 +263,31 @@ pub fn start_scan(
         // Scan duration
         let scan_duration_ms = scan_start_time.elapsed().as_millis() as u64;
 
+        // Post-process directory sizes: propagate immediate parent sizes to all ancestors
+        let mut full_dir_map: HashMap<String, u64> = HashMap::new();
+        let root_path_buf = std::path::Path::new(&root_path_clone);
+
+        for (dir_path_str, size) in local_res.dir_map {
+            let dir_path = std::path::Path::new(&dir_path_str);
+            let mut current = Some(dir_path);
+            while let Some(path) = current {
+                if !path.starts_with(root_path_buf) {
+                    break;
+                }
+                let p_str = path.to_string_lossy().to_string();
+                if p_str.is_empty() {
+                    break;
+                }
+                *full_dir_map.entry(p_str).or_insert(0) += size;
+                current = path.parent();
+            }
+        }
+
         // Compile results
         let mut ext_breakdown: Vec<(String, u64)> = local_res.ext_map.into_iter().collect();
         ext_breakdown.sort_unstable_by(|a, b| b.1.cmp(&a.1));
 
-        let mut dir_breakdown: Vec<(String, u64)> = local_res.dir_map.into_iter().collect();
+        let mut dir_breakdown: Vec<(String, u64)> = full_dir_map.into_iter().collect();
         dir_breakdown.sort_unstable_by(|a, b| b.1.cmp(&a.1));
         if dir_breakdown.len() > 20 {
             dir_breakdown.truncate(20);
