@@ -42,7 +42,7 @@ struct DiskAnalyzerApp {
 impl DiskAnalyzerApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         // Set up CJK font fallback from system fonts
-        let mut fonts = egui::FontDefinitions::default();
+        let fonts = egui::FontDefinitions::default();
         #[cfg(target_os = "windows")]
         {
             let font_paths = [
