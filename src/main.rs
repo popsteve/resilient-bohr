@@ -201,8 +201,9 @@ fn reveal_in_explorer(path: &str) {
     if p.exists() {
         #[cfg(target_os = "windows")]
         {
+            use std::os::windows::process::CommandExt;
             let _ = std::process::Command::new("explorer")
-                .arg(format!("/select,{}", p.to_string_lossy()))
+                .raw_arg(format!(r#"/select,"{}""#, p.to_string_lossy()))
                 .spawn();
         }
         #[cfg(not(target_os = "windows"))]
